@@ -24,6 +24,44 @@ Each ported file carries an attribution header pointing here. Ported
 code remains under the upstream's MIT OR Apache-2.0 terms; this notice
 and those headers satisfy the attribution requirement.
 
+## NanoBoyAdvance
+
+- **Upstream:** https://codeberg.org/nba-emu/NanoBoyAdvance
+- **Authors:** Mireille Meyer, Gloria Goertz, and contributors
+- **License:** BSD-2-Clause
+
+| Our file | Upstream source | What was ported |
+|---|---|---|
+| `src/runtime/present_effects.h` | `Sources/NanoBoyAdvanceQt/Content/Shaders/Filters.hlsl` (`FLCDGhost`, `VLCD1x` / `FLCD1x`) | The LCD ghosting blend (each frame averaged with the previous one) and the 1x LCD grid (a horizontal and a vertical sine of one-pixel period, phased to peak at pixel centres). Re-implemented in C++ for the CPU present path. |
+| `src/runtime/color_lut.{h,cpp}` | same file, `FColorCorrect` | The constants of the `agb` screen model: input gamma 3.2, 0.94 luminance, the 3x3 cross-talk matrix, 2.2 output gamma. |
+
+Both files carry an attribution header pointing here, and the full notice —
+copyright line, conditions and disclaimer — is reproduced in
+[`third_party/BSD-2-Clause.txt`](third_party/BSD-2-Clause.txt). Both effects
+are opt-in and default off (see `ENHANCEMENTS.md` §4).
+
+Where the two effects come from, further back than `Filters.hlsl` (which
+itself carries no per-effect notes):
+
+- **The `agb` model** takes its numbers from hunterk's "Color Mangler" as
+  modified by Pokefan531. That shader's own header reads "License: Public
+  domain" (seen in NanoBoyAdvance's history at `643ba25b`,
+  `color_agb.glsl.hpp`).
+- **The ghosting blend** is a plain average of two frames, with no earlier
+  source.
+- **The LCD grid** is Gigaherz's `lcd3x` formula, `(B + sin(angle)) / (B + 1)`
+  on each axis with `B = 16` on the scanline axis. RetroArch ships `lcd3x` as
+  public domain (`libretro/glsl-shaders`, `handheld/shaders/lcd3x.glsl`). The
+  `lcd1x` variant NanoBoyAdvance carried is nearly the same text as RetroArch's
+  `lcd1x.glsl` ("Edited by jdgleaver" there; "Ported to NanoBoyAdvance by
+  Destiny" in `60fdedcc`); both dropped lcd3x's per-channel colour separation,
+  added a quarter-pixel phase shift, and carry a GPL-2.0-or-later notice.
+  NanoBoyAdvance rewrote it as `FLCD1x`
+  for 2.0 and relicensed the project under BSD-2-Clause in `34de0ff5`
+  (2026-06-26); this port follows that file's label. Of the grid, only the
+  phase shift and one constant (`BRIGHTEN_LCD` 24, where `lcd3x` has 4) are
+  not already in `lcd3x`.
+
 ## mGBA
 
 - **Upstream:** https://github.com/mgba-emu/mgba (cloned locally for the

@@ -19,6 +19,7 @@
 #include "color_lut.h"
 #include "host_overlay.h"
 #include "presentation_layout.h"
+#include "present_effects.h"
 #include "touch_input.h"
 #if defined(GBARECOMP_RUNTIME_UI)
 #include "recomp_runtime_ui.h"
@@ -423,6 +424,21 @@ struct Backend {
     // grading), so default behavior is byte-identical to upstream.
     std::unique_ptr<runtime::ColorLut> color_lut;
     std::vector<uint8_t> graded_fb;  // scratch RGB888 (base_w*base_h*3)
+    // Present-time LCD effects (present_effects.h). Ghosting keeps a copy of
+    // the previous presented frame. The grid bakes the panel's pixel
+    // structure into an integer prescale texture that stands in for the frame
+    // texture while it is drawn.
+    bool lcd_ghosting = false;
+    bool lcd_grid = false;
+    std::vector<uint8_t> previous_fb;  // previous presented frame, raw RGB888
+    std::vector<uint8_t> ghost_fb;     // scratch RGB888
+    bool has_previous_frame = false;
+    runtime::LcdGrid grid;
+    SDL_Texture*  grid_texture = nullptr;
+    int           grid_texture_w = 0;
+    int           grid_texture_h = 0;
+    bool          grid_texture_failed = false;
+    std::vector<std::uint32_t> grid_fb;  // scratch XRGB8888
 #if defined(GBARECOMP_RUNTIME_UI)
     RecompRuntimeUi* runtime_ui = nullptr;
     ImGuiContext* runtime_imgui_context = nullptr;
@@ -526,6 +542,91 @@ bool ensure_sharp_texture(Backend* b, int factor) {
     SDL_SetTextureScaleMode(b->sharp_texture, SDL_ScaleModeLinear);
 #endif
     return true;
+}
+
+void destroy_grid_texture(Backend* b) {
+    if (!b) return;
+    if (b->grid_texture) SDL_DestroyTexture(b->grid_texture);
+    b->grid_texture = nullptr;
+    b->grid_texture_w = 0;
+    b->grid_texture_h = 0;
+}
+
+// Forget everything derived from earlier frames: after a surface resize the
+// previous frame no longer matches, and a ghost of it would be garbage.
+void clear_frame_history(Backend* b) {
+    b->previous_fb.clear();
+    b->ghost_fb.clear();
+    b->has_previous_frame = false;
+}
+
+// The LCD grid as a texture that stands in for the frame texture: `frame`
+// (already ghosted and graded) expanded by whole sub-pixels, each shaded by
+// the grid. Null when the destination is too small for a grid to show — below
+// 2x — or when the renderer cannot take the texture; the caller then draws
+// the frame itself.
+SDL_Texture* lcd_grid_texture(Backend* b, const uint8_t* frame,
+                              const PresentationLayout& layout) {
+    const int factor = runtime::lcd_grid_factor(layout.width, layout.height,
+                                                b->base_w, b->base_h);
+    if (factor < 2) return nullptr;
+    if (factor != b->grid.factor) b->grid = runtime::make_lcd_grid(factor);
+    const int width = b->base_w * factor;
+    const int height = b->base_h * factor;
+    if (!b->grid_texture || b->grid_texture_w != width ||
+        b->grid_texture_h != height) {
+        destroy_grid_texture(b);
+        b->grid_texture = SDL_CreateTexture(
+            b->renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING,
+            width, height);
+        if (!b->grid_texture) {
+            if (!b->grid_texture_failed) {
+                std::fprintf(stderr,
+                             "host_window: LCD grid texture %dx%d failed: %s; "
+                             "drawing without the grid\n",
+                             width, height, SDL_GetError());
+                b->grid_texture_failed = true;
+            }
+            return nullptr;
+        }
+        b->grid_texture_w = width;
+        b->grid_texture_h = height;
+        b->grid_texture_failed = false;
+        SDL_SetTextureBlendMode(b->grid_texture, SDL_BLENDMODE_NONE);
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+        SDL_SetTextureScaleMode(
+            b->grid_texture,
+            b->linear_filter ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+#endif
+    }
+    b->grid_fb.resize(static_cast<std::size_t>(width) * height);
+    runtime::expand_lcd_grid(frame, b->base_w, b->base_h, b->grid,
+                             b->grid_fb.data());
+    if (SDL_UpdateTexture(b->grid_texture, nullptr, b->grid_fb.data(),
+                          width * 4) != 0) {
+        if (!b->grid_texture_failed) {
+            std::fprintf(stderr,
+                         "host_window: LCD grid upload failed: %s; drawing "
+                         "without the grid\n",
+                         SDL_GetError());
+            b->grid_texture_failed = true;
+        }
+        destroy_grid_texture(b);
+        return nullptr;
+    }
+    return b->grid_texture;
+}
+
+// The sharp scaler's prescale factor for the fixed 240x160 presentation,
+// which goes through SDL's logical size rather than an explicit destination.
+// Whole multiples of the logical size need no intermediate pass.
+int native_sharp_factor(const Backend* b, const PresentationLayout& layout) {
+    if (layout.width <= 0 || layout.height <= 0) return 0;
+    if (layout.width % b->base_w == 0 && layout.height % b->base_h == 0)
+        return 0;
+    const int factor = std::min(layout.width / b->base_w,
+                                layout.height / b->base_h);
+    return factor >= 2 ? factor : 0;
 }
 
 void close_game_controller(Backend* b) {
@@ -1267,8 +1368,8 @@ void ini_scan_section(const char* path, const char* section, Fn fn) {
 
 // Resolve the screen model: the per-game [video].screen from game.toml
 // (`toml_screen`) is the default; GBARECOMP_SCREEN overrides it at launch.
-// Unset/unrecognized → Raw (passthrough). Tokens: raw|unlit|frontlit|
-// backlit|classic.
+// Unset/unrecognized → Raw (passthrough). Tokens: runtime::kScreenKindNames
+// (raw|unlit|frontlit|backlit|classic|agb).
 runtime::ColorSettings resolve_color_settings(const char* toml_screen) {
     runtime::ColorSettings s;
     runtime::ScreenKind k;
@@ -2107,6 +2208,7 @@ void HostWindow::close() {
     runtime_imgui_shutdown(b);
 #endif
     destroy_sharp_texture(b);
+    destroy_grid_texture(b);
     if (b->texture)   SDL_DestroyTexture(b->texture);
     if (b->renderer)  SDL_DestroyRenderer(b->renderer);
     if (b->window)    SDL_DestroyWindow(b->window);
@@ -2138,10 +2240,12 @@ bool HostWindow::set_surface_size(int base_w, int base_h) {
 #endif
     SDL_DestroyTexture(b->texture);
     destroy_sharp_texture(b);
+    destroy_grid_texture(b);
     b->texture = replacement;
     b->base_w = base_w;
     b->base_h = base_h;
     b->expanded_view = base_w != 240 || base_h != 160;
+    clear_frame_history(b);
     if (b->color_lut && !b->color_lut->is_passthrough())
         b->graded_fb.resize(static_cast<std::size_t>(base_w) * base_h * 3u);
     return true;
@@ -2180,11 +2284,40 @@ bool HostWindow::drawable_size(int* width, int* height) const {
 void HostWindow::present(const uint8_t* rgb888) {
     if (!open_ || !impl_ || !rgb888) return;
     auto* b = static_cast<Backend*>(impl_);
-    // Present-time color grading (opt-in). Raw is passthrough: the raw
-    // PPU frame is uploaded untouched, so verify/frame-hash are unaffected.
+    const std::size_t frame_bytes =
+        static_cast<std::size_t>(b->base_w) * b->base_h * 3u;
+    // Present-time LCD effects (all opt-in), in the order the panel itself
+    // applies them: its response blends the frame with the previous one, its
+    // colour model grades the result, and — further down, once the
+    // destination is known — its pixel grid shades the scaled-up image.
+    // Every stage works on a scratch copy, so the raw PPU frame is never
+    // modified: Raw with both effects off uploads it untouched, and
+    // verify/frame-hash are unaffected either way.
+    if (b->lcd_ghosting) {
+        if (b->previous_fb.size() != frame_bytes) {
+            // No predecessor yet (first frame, or the surface was resized):
+            // the frame is its own, rather than ghosting a black or stale one.
+            b->previous_fb.assign(rgb888, rgb888 + frame_bytes);
+            b->has_previous_frame = false;
+        }
+        b->ghost_fb.resize(frame_bytes);
+        runtime::blend_ghost_frame(
+            rgb888,
+            b->has_previous_frame ? b->previous_fb.data() : rgb888,
+            b->ghost_fb.data(), frame_bytes);
+        std::memcpy(b->previous_fb.data(), rgb888, frame_bytes);
+        b->has_previous_frame = true;
+        rgb888 = b->ghost_fb.data();
+    }
     if (b->color_lut && !b->color_lut->is_passthrough() &&
-        b->graded_fb.size() == static_cast<std::size_t>(b->base_w) * b->base_h * 3u) {
-        b->color_lut->map_rgb888(rgb888, b->graded_fb.data(), b->base_w, b->base_h);
+        b->graded_fb.size() == frame_bytes) {
+        // A ghosted frame sits between hardware colors, where the top 5 bits
+        // no longer identify the source color: grade it per pixel instead.
+        if (b->lcd_ghosting)
+            b->color_lut->map_rgb888_exact(rgb888, b->graded_fb.data(),
+                                           b->base_w, b->base_h);
+        else
+            b->color_lut->map_rgb888(rgb888, b->graded_fb.data(), b->base_w, b->base_h);
         rgb888 = b->graded_fb.data();
     }
     SDL_UpdateTexture(b->texture, nullptr, rgb888, b->base_w * 3);
@@ -2254,18 +2387,51 @@ void HostWindow::present(const uint8_t* rgb888) {
         std::fflush(stderr);
     }
     if (touch_input_enabled(b)) publish_touch_presentation(b);
+    // The LCD grid swaps in a prescaled copy of the frame with the grid baked
+    // in. That already is an integer prescale, so the sharp scaler steps aside
+    // while it shows; whatever stretch is left over is SDL's, on every
+    // presentation path alike.
+    SDL_Texture* shown = b->texture;
+    bool grid_active = false;
+    if (b->lcd_grid) {
+        if (SDL_Texture* grid = lcd_grid_texture(b, rgb888, layout)) {
+            shown = grid;
+            grid_active = true;
+        }
+    }
 #if defined(__ANDROID__)
     const SDL_Rect destination{layout.x, layout.y, layout.width, layout.height};
-    SDL_RenderCopy(b->renderer, b->texture, nullptr, &destination);
+    SDL_RenderCopy(b->renderer, shown, nullptr, &destination);
 #else
     if (!b->expanded_view && !b->resize_driven_view) {
-        SDL_RenderCopy(b->renderer, b->texture, nullptr, nullptr);
+        // The fixed 240x160 presentation stretches through SDL's logical
+        // size, so the sharp prescale (and the grid above) is drawn into that
+        // same logical area and SDL scales it the rest of the way.
+        SDL_Texture* drawn = shown;
+        if (b->sharp_filter && !grid_active) {
+            const int sharp_factor = native_sharp_factor(b, layout);
+            if (sharp_factor > 0 &&
+                ensure_sharp_texture(b, sharp_factor) &&
+                SDL_SetRenderTarget(b->renderer, b->sharp_texture) == 0) {
+                const bool prescaled =
+                    SDL_RenderCopy(
+                        b->renderer, b->texture, nullptr, nullptr) == 0;
+                const bool restored =
+                    SDL_SetRenderTarget(b->renderer, nullptr) == 0;
+                if (prescaled && restored) drawn = b->sharp_texture;
+            }
+            // Exact integer scales and unsupported render-target backends
+            // retain the crisp nearest path.
+            if (drawn != b->sharp_texture)
+                SDL_SetRenderTarget(b->renderer, nullptr);
+        }
+        SDL_RenderCopy(b->renderer, drawn, nullptr, nullptr);
     } else {
         if (layout.width > 0 && layout.height > 0) {
             const SDL_Rect destination = {
                 layout.x, layout.y, layout.width, layout.height};
             bool sharp_presented = false;
-            const int sharp_factor = b->sharp_filter
+            const int sharp_factor = b->sharp_filter && !grid_active
                 ? compute_sharp_prescale_factor(
                       layout, b->base_w, b->base_h)
                 : 0;
@@ -2274,7 +2440,7 @@ void HostWindow::present(const uint8_t* rgb888) {
                 SDL_SetRenderTarget(b->renderer, b->sharp_texture) == 0) {
                 const bool prescaled =
                     SDL_RenderCopy(
-                        b->renderer, b->texture, nullptr, nullptr) == 0;
+                        b->renderer, shown, nullptr, nullptr) == 0;
                 const bool restored =
                     SDL_SetRenderTarget(b->renderer, nullptr) == 0;
                 if (prescaled && restored) {
@@ -2289,7 +2455,7 @@ void HostWindow::present(const uint8_t* rgb888) {
                 // retain the crisp nearest path.
                 SDL_SetRenderTarget(b->renderer, nullptr);
                 SDL_RenderCopy(
-                    b->renderer, b->texture, nullptr, &destination);
+                    b->renderer, shown, nullptr, &destination);
             }
         }
     }
@@ -2462,13 +2628,61 @@ void HostWindow::set_linear_filter(bool enabled) {
     }
     b->linear_filter = enabled;
 #if SDL_VERSION_ATLEAST(2, 0, 12)
+    // The LCD grid texture takes the frame texture's place, so it takes the
+    // scaler choice with it.
     SDL_SetTextureScaleMode(b->texture,
         enabled ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+    if (b->grid_texture)
+        SDL_SetTextureScaleMode(b->grid_texture,
+            enabled ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
 #endif
 }
 
 bool HostWindow::linear_filter() const {
     return open_ && impl_ && static_cast<const Backend*>(impl_)->linear_filter;
+}
+
+void HostWindow::set_lcd_ghosting(bool enabled) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    b->lcd_ghosting = enabled;
+    // Start fresh: the next frame must not ghost whatever was on screen the
+    // last time the effect ran.
+    clear_frame_history(b);
+}
+
+bool HostWindow::lcd_ghosting() const {
+    return open_ && impl_ && static_cast<const Backend*>(impl_)->lcd_ghosting;
+}
+
+void HostWindow::set_lcd_grid(bool enabled) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    b->lcd_grid = enabled;
+    if (!enabled) destroy_grid_texture(b);
+}
+
+bool HostWindow::lcd_grid() const {
+    return open_ && impl_ && static_cast<const Backend*>(impl_)->lcd_grid;
+}
+
+void HostWindow::set_screen(const char* screen) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    // A live choice is the player's, so GBARECOMP_SCREEN (a launch-time
+    // override) deliberately does not apply here.
+    runtime::ColorSettings settings;
+    runtime::ScreenKind kind;
+    if (screen && runtime::screen_kind_from_name(screen, kind))
+        settings.screen = kind;
+    b->color_lut = std::make_unique<runtime::ColorLut>(settings);
+    b->graded_fb.resize(static_cast<std::size_t>(b->base_w) * b->base_h * 3u);
+}
+
+int HostWindow::screen_model() const {
+    if (!open_ || !impl_) return static_cast<int>(runtime::ScreenKind::Raw);
+    const auto* b = static_cast<const Backend*>(impl_);
+    return static_cast<int>(b->color_lut->kind());
 }
 
 void HostWindow::set_audio_enabled(bool enabled) {
@@ -3098,6 +3312,12 @@ int  HostWindow::volume() const { return 100; }
 int  HostWindow::window_scale() const { return 1; }
 void HostWindow::set_linear_filter(bool /*enabled*/) {}
 bool HostWindow::linear_filter() const { return false; }
+void HostWindow::set_lcd_ghosting(bool /*enabled*/) {}
+bool HostWindow::lcd_ghosting() const { return false; }
+void HostWindow::set_lcd_grid(bool /*enabled*/) {}
+bool HostWindow::lcd_grid() const { return false; }
+void HostWindow::set_screen(const char* /*screen*/) {}
+int  HostWindow::screen_model() const { return 0; }
 void HostWindow::set_audio_enabled(bool /*enabled*/) {}
 bool HostWindow::audio_enabled() const { return false; }
 void HostWindow::set_resize_driven_view(bool /*enabled*/) {}

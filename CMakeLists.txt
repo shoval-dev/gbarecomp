@@ -857,6 +857,11 @@ add_executable(presentation_layout_tests tests/presentation_layout/test_main.cpp
 target_include_directories(presentation_layout_tests PRIVATE src/runtime)
 add_test(NAME presentation_layout_tests COMMAND presentation_layout_tests)
 
+# Present-time LCD effects (ghosting blend, pixel grid): pure byte math.
+add_executable(present_effects_tests tests/runtime/present_effects_test.cpp)
+target_include_directories(present_effects_tests PRIVATE src/runtime)
+add_test(NAME present_effects_tests COMMAND present_effects_tests)
+
 # Touch input: gesture recognizer, hub rings/scripts, key synthesis, JSON.
 add_gbarecomp_runtime_stack_test(touch_input_tests tests/touch_input/test_main.cpp)
 

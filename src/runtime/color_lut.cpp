@@ -1,11 +1,13 @@
 // color_lut.cpp — see color_lut.h. Present-time only.
 //
 // Ported from JRickey/gba-recomp (crates/screen/src/{color,profile,lut}.rs),
-// © Jrickey, MIT OR Apache-2.0, used with permission. See
-// THIRD_PARTY_ATTRIBUTION.md.
+// © Jrickey, MIT OR Apache-2.0, used with permission. The "agb" model's
+// constants are ported from NanoBoyAdvance's Filters.hlsl (BSD-2-Clause;
+// full notice: third_party/BSD-2-Clause.txt). See THIRD_PARTY_ATTRIBUTION.md.
 
 #include "color_lut.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cmath>
 #include <cstring>
@@ -161,6 +163,59 @@ std::array<uint8_t, 3> classic_entry(uint16_t px) {
             quantize(mix(220.0, 10.0, 50.0))};
 }
 
+// ── The "agb" model ──────────────────────────────────────────────────
+// hunterk's Color Mangler as tuned for the GBA LCD — the algorithm behind
+// NanoBoyAdvance's "Color Correction". An input gamma of 3.2 (a 2.2 target
+// gamma plus a full stop of screen darkening) and a 0.94 luminance factor
+// push the midtones well down, a cross-talk matrix pulls reds towards pink,
+// greens towards yellow and blues towards cyan, and a 2.2 output gamma brings
+// the result back to display space. Every row of the matrix sums to 1, so
+// white stays neutral and only loses the 0.94. The shader's saturate() is an
+// identity here, and its contrast and saturation controls are identities at
+// these settings, so neither appears.
+constexpr double kAgbInputGamma = 3.2;
+constexpr double kAgbLuminance = 0.94;
+constexpr double kAgbDisplayGamma = 2.2;
+constexpr double kAgbMatrix[3][3] = {
+    {0.820, 0.240, -0.060},  // red   ← r,  gr,  br
+    {0.125, 0.665,  0.210},  // green ← rg, g,   bg
+    {0.195, 0.075,  0.730},  // blue  ← rb, gb,  b
+};
+
+double agb_linear(double channel01) {
+    return std::min(1.0, std::pow(channel01, kAgbInputGamma) * kAgbLuminance);
+}
+
+// The PPU's 5→8 bit expansion of a hardware level.
+constexpr int hardware_byte(int level5) { return (level5 << 3) | (level5 >> 2); }
+
+// What level does an 8-bit value represent? The table models are defined on
+// the true 15-bit level, which a PPU frame carries as hardware_byte(level).
+// A ghosted frame carries averages of two such bytes, so it also has every
+// value in between: those decode linearly between the levels around them.
+// hardware_byte itself is the identity on this table's 32 anchor points, so
+// a frame straight from the PPU decodes to exactly the level it was expanded
+// from and grades exactly as the 32768-entry table says.
+std::array<double, 256> build_level_decode() {
+    std::array<double, 256> decode{};
+    decode[0] = 0.0;
+    int level = 0;
+    for (int byte = 1; byte < 256; ++byte) {
+        while (level < 31 && byte > hardware_byte(level + 1)) ++level;
+        const int low = hardware_byte(level);
+        const int high = level < 31 ? hardware_byte(level + 1) : 255;
+        decode[static_cast<std::size_t>(byte)] =
+            (level + static_cast<double>(byte - low) / (high - low)) / 31.0;
+    }
+    return decode;
+}
+
+// Saturated blues go negative in the red row (br = -0.06); the shader feeds
+// that to pow(), which is undefined, so clamp first.
+double agb_transfer(double x) {
+    return std::pow(std::max(x, 0.0), 1.0 / kAgbDisplayGamma);
+}
+
 const Primaries& target_primaries(DisplayTarget t) {
     return t == DisplayTarget::DisplayP3 ? kDisplayP3 : kSrgb;
 }
@@ -168,15 +223,22 @@ const Primaries& target_primaries(DisplayTarget t) {
 }  // namespace
 
 bool screen_kind_from_name(std::string_view name, ScreenKind& out) {
-    if (name == "raw")      { out = ScreenKind::Raw;      return true; }
-    if (name == "unlit")    { out = ScreenKind::Unlit;    return true; }
-    if (name == "frontlit") { out = ScreenKind::Frontlit; return true; }
-    if (name == "backlit")  { out = ScreenKind::Backlit;  return true; }
-    if (name == "classic")  { out = ScreenKind::Classic;  return true; }
+    for (int kind = 0; kind < kScreenKindCount; ++kind) {
+        if (name == kScreenKindNames[kind]) {
+            out = static_cast<ScreenKind>(kind);
+            return true;
+        }
+    }
     return false;
 }
 
+std::string_view screen_kind_name(ScreenKind kind) {
+    const int index = static_cast<int>(kind);
+    return kScreenKindNames[index >= 0 && index < kScreenKindCount ? index : 0];
+}
+
 ColorLut::ColorLut(const ColorSettings& settings) {
+    kind_ = settings.screen;
     if (settings.screen == ScreenKind::Raw) {
         passthrough_ = true;
         return;
@@ -187,6 +249,27 @@ ColorLut::ColorLut(const ColorSettings& settings) {
     if (settings.screen == ScreenKind::Classic) {
         for (int px = 0; px < 32768; ++px)
             table[px] = classic_entry(static_cast<uint16_t>(px));
+        build_exact(settings);
+        return;
+    }
+    if (settings.screen == ScreenKind::Agb) {
+        // Defined, like the shader, on the 8-bit value the PPU expands a
+        // level to (hardware_byte / 255), not on the level itself. The two
+        // differ by under half a percent, which is invisible except where the
+        // matrix's negative term nearly cancels the red row.
+        for (int px = 0; px < 32768; ++px) {
+            const double lr = agb_linear(hardware_byte(px & 31) / 255.0);
+            const double lg = agb_linear(hardware_byte((px >> 5) & 31) / 255.0);
+            const double lb = agb_linear(hardware_byte((px >> 10) & 31) / 255.0);
+            table[px] = {
+                quantize(agb_transfer(kAgbMatrix[0][0] * lr + kAgbMatrix[0][1] * lg +
+                                      kAgbMatrix[0][2] * lb)),
+                quantize(agb_transfer(kAgbMatrix[1][0] * lr + kAgbMatrix[1][1] * lg +
+                                      kAgbMatrix[1][2] * lb)),
+                quantize(agb_transfer(kAgbMatrix[2][0] * lr + kAgbMatrix[2][1] * lg +
+                                      kAgbMatrix[2][2] * lb))};
+        }
+        build_exact(settings);
         return;
     }
 
@@ -213,6 +296,94 @@ ColorLut::ColorLut(const ColorSettings& settings) {
         }
         table[px] = {quantize(out[0]), quantize(out[1]), quantize(out[2])};
     }
+    build_exact(settings);
+}
+
+// ── Per-pixel form of the model (map_rgb888_exact) ────────────────────
+//
+// Same three stages as the table build above — per-channel input gamma and
+// luminance, cross-talk, output transfer — but from the true 8-bit level
+// instead of one recovered from the top 5 bits. The first two stages are a
+// 256-entry table and nine multiplies. Only the transfer is expensive (a pow
+// per channel per pixel), so it is tabulated: 8192 linear segments across
+// [0, 1.25] hold the interpolation error below a quarter of a level wherever
+// the curve is gentle enough, and the darkest stretch (x < 1/256, the lowest
+// 16 levels, where it is steepest) and anything past the span are evaluated
+// exactly.
+constexpr double kTransferSpan = 1.25;
+constexpr float kTransferExactBelow = 1.0f / 256.0f;
+
+void ColorLut::build_exact(const ColorSettings& settings) {
+    transfer_table_.fill(0.0f);
+
+    Mat3 matrix{};
+    if (settings.screen == ScreenKind::Agb) {
+        for (int c = 0; c < 256; ++c) linear_[c] = static_cast<float>(agb_linear(c / 255.0));
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) matrix.m[r][c] = kAgbMatrix[r][c];
+        transfer_ = Transfer::Gamma22;
+    } else {
+        // The other models take the true level; see build_level_decode().
+        const std::array<double, 256> decode = build_level_decode();
+        if (settings.screen == ScreenKind::Classic) {
+            for (int c = 0; c < 256; ++c)
+                linear_[c] = static_cast<float>(std::pow(decode[static_cast<std::size_t>(c)], 4.0));
+            matrix.m[0][0] = 255.0; matrix.m[0][1] = 50.0;  matrix.m[0][2] = 0.0;
+            matrix.m[1][0] = 10.0;  matrix.m[1][1] = 230.0; matrix.m[1][2] = 30.0;
+            matrix.m[2][0] = 50.0;  matrix.m[2][1] = 10.0;  matrix.m[2][2] = 220.0;
+            transfer_ = Transfer::Classic;
+        } else {
+            double darken = settings.darken < 0.0 ? default_darken(settings.screen)
+                                                  : settings.darken;
+            PanelModel model{};
+            panel_model(settings.screen, darken, model);
+            matrix = rgb_to_rgb(model.primaries, target_primaries(settings.target));
+            for (int c = 0; c < 256; ++c)
+                linear_[c] = static_cast<float>(std::min(
+                    1.0, std::pow(decode[static_cast<std::size_t>(c)], model.gamma) *
+                             model.luminance));
+            transfer_ = Transfer::Srgb;
+            black_floor_ = static_cast<float>(model.black_floor);
+        }
+    }
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) matrix_[r * 3 + c] = static_cast<float>(matrix.m[r][c]);
+
+    for (int i = 0; i <= kTransferSegments; ++i)
+        transfer_table_[i] = exact_transfer(kTransferSpan * i / kTransferSegments);
+}
+
+// The output transfer in 8-bit levels, evaluated in double.
+float ColorLut::exact_transfer(double x) const {
+    switch (transfer_) {
+        case Transfer::Gamma22: return static_cast<float>(255.0 * agb_transfer(x));
+        case Transfer::Classic:
+            // mix(): pow(sum / 255, 1/2.2) * 255/280, which quantize() then
+            // multiplies by 255.
+            return static_cast<float>(255.0 * 255.0 / 280.0 *
+                                      agb_transfer(x / 255.0));
+        case Transfer::Srgb: {
+            // clamp(x, 0, 1) -> panel black floor -> sRGB OETF.
+            const double v = std::clamp(x, 0.0, 1.0);
+            return static_cast<float>(255.0 * srgb_oetf(black_floor_ +
+                                                        (1.0 - black_floor_) * v));
+        }
+    }
+    return 0.0f;
+}
+
+float ColorLut::tabled_transfer(float x) const {
+    if (x < kTransferExactBelow || x >= static_cast<float>(kTransferSpan))
+        return exact_transfer(x);
+    constexpr float kScale = static_cast<float>(kTransferSegments / kTransferSpan);
+    const float position = x * kScale;
+    int index = static_cast<int>(position);
+    // Rounding can land the largest representable x below the span on the
+    // segment one past the table.
+    if (index >= kTransferSegments) index = kTransferSegments - 1;
+    const float base = transfer_table_[static_cast<std::size_t>(index)];
+    return base + (transfer_table_[static_cast<std::size_t>(index) + 1] - base) *
+                      (position - static_cast<float>(index));
 }
 
 void ColorLut::map_rgb888(const uint8_t* src, uint8_t* dst,
@@ -234,6 +405,29 @@ void ColorLut::map_rgb888(const uint8_t* src, uint8_t* dst,
         d[0] = e[0];
         d[1] = e[1];
         d[2] = e[2];
+    }
+}
+
+void ColorLut::map_rgb888_exact(const uint8_t* src, uint8_t* dst,
+                                int width, int height) const {
+    if (!table_) {
+        map_rgb888(src, dst, width, height);
+        return;
+    }
+    const float* linear = linear_.data();
+    const float* matrix = matrix_.data();
+    const int n = width * height;
+    for (int i = 0; i < n; ++i) {
+        const uint8_t* s = src + i * 3;
+        const float r = linear[s[0]];
+        const float g = linear[s[1]];
+        const float b = linear[s[2]];
+        uint8_t* d = dst + i * 3;
+        for (int channel = 0; channel < 3; ++channel) {
+            const float* row = matrix + channel * 3;
+            const float levels = tabled_transfer(row[0] * r + row[1] * g + row[2] * b);
+            d[channel] = static_cast<uint8_t>(std::clamp(levels + 0.5f, 0.0f, 255.0f));
+        }
     }
 }
 

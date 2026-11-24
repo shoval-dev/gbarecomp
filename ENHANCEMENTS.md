@@ -121,3 +121,64 @@ literal reads after ROM identity verification, and `g_ws_obj_x_provider` can
 interpret an opted-in game's extended OBJ coordinates in the wide PPU path.
 Neither is consulted by native 240x160 OBJ rendering; games must prove their
 coordinate invariant and leave both hooks unset unless expanded view is active.
+
+---
+
+## 4. Present-time screen models and LCD effects
+
+What the window shows between the PPU's frame and SDL is presentation, not
+emulation. `HostWindow::present()` applies the following to a **copy** of each
+frame at upload time. The PPU framebuffer, save states and the
+differential-verify path (diff_frame, oracle, frame hashes) stay defined on the
+raw RGB888, and every option is off by default, so the default window shows the
+raw frame exactly as before.
+
+| Order | Effect | What it does | Selectors |
+|---|---|---|---|
+| 1 | LCD ghosting | Each presented frame averaged 50/50 with the one before it: `G_t = 0.5*F_t + 0.5*F_{t-1}`, a two-tap average with no feedback. | `[video].lcd_ghosting`, `--lcd-ghosting 0\|1` |
+| 2 | Screen model | Colour grading: `raw` (passthrough, default), the measured `unlit` / `frontlit` / `backlit` panels, `classic` (the common gamma-4.0 formula), and `agb` (input gamma 3.2, 0.94 luminance, an LCD cross-talk matrix, 2.2 output gamma — NanoBoyAdvance's "Color Correction"). | `[video].screen`, `--screen`, `GBARECOMP_SCREEN` |
+| 3 | LCD grid | Every logical pixel shaded with a bright centre and darker edges (NanoBoyAdvance's "LCD1x"), baked into an integer prescale of the frame. | `[video].lcd_grid`, `--lcd-grid 0\|1` |
+
+The order is the panel's own, and it matters: the screen models are non-linear,
+so grading a blend is not blending the grades (on a black-to-white step the
+first blended frame grades to 91 one way and 124 the other).
+
+- **Ghosting keeps the previous *presented* frame**, so fast-forward (which
+  presents every Nth frame) ghosts against the last frame shown, not the last
+  one emulated. The first frame after the effect is switched on, or after a
+  surface resize, has no predecessor and is shown alone.
+- **A ghosted frame leaves the 5-bit grid.** The screen models are a
+  32768-entry table indexed by the top 5 bits of each channel, which a PPU
+  frame always is; the average of two colors is not. With ghosting on, the
+  model is therefore evaluated per pixel from the true 8-bit level instead
+  (`ColorLut::map_rgb888_exact`). The two agree within ±1 on a
+  hardware-expanded frame, so a still picture looks the same with ghosting on
+  and off.
+- **`agb` is defined on the 8-bit value the PPU expands a level to**, as the
+  shader reads it, not on the level itself. The other models are defined on
+  the true 15-bit level, as before and byte-identically. The two conventions
+  differ by under half a percent — invisible, except where `agb`'s negative
+  coefficient nearly cancels its red row on saturated blues.
+- **The grid needs room.** It takes the whole part of the window scale (a 3x
+  window gets a 3x grid, capped at 6x) and the scaler handles the rest, which
+  is why it works on every presentation path. At 2x both sub-pixels of an axis
+  sit at the same height on the sine and the image merely darkens by about
+  10%; below 2x nothing is drawn. It follows the linear-filter choice for the
+  leftover stretch, and takes precedence over the sharp scaler, which does the
+  same prescale without the shading.
+- **The sharp scaler now also serves the fixed 240x160 presentation**, which
+  used to go straight to SDL's logical-size stretch whatever `--sharp-filter`
+  said. Expanded views are unchanged.
+
+A game opts in with `RunOptions::launcher_expose_lcd_ghosting` /
+`launcher_expose_lcd_grid` (plus the matching `launcher_default_*`). That adds
+the two rows to the recomp-ui launcher's Video panel and, in builds with the
+in-game menu (`GBARECOMP_RUNTIME_UI`), to that menu as well, where the screen
+model is a row too. The launcher seam persists the choices in
+`config.ini [Launcher]` as `lcd_ghosting` / `lcd_grid` and passes them per run.
+In-game changes apply live but, like every other in-game graphics row, last
+for the session.
+
+Tests: `color_lut_tests` (the `agb` table against the formula, and both paths
+against each other on every hardware color) and `present_effects_tests` (the
+blend and the grid factors).

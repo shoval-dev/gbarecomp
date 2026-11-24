@@ -175,6 +175,55 @@ inline void set_presentation_filter_caps(T& game_info,
     }
 }
 
+// And for the LCD effects (the panel's own ghosting and pixel grid), which
+// post-date this header's first recomp-ui pins as well.
+template <typename T, typename = void>
+struct has_lcd_effects : std::false_type {};
+
+template <typename T>
+struct has_lcd_effects<
+    T,
+    std::void_t<decltype(std::declval<T&>().lcd_ghosting),
+                decltype(std::declval<T&>().lcd_grid)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_lcd_effect_caps : std::false_type {};
+
+template <typename T>
+struct has_lcd_effect_caps<
+    T,
+    std::void_t<decltype(std::declval<T&>().has_lcd_ghosting),
+                decltype(std::declval<T&>().has_lcd_grid)>> : std::true_type {};
+
+// Returns false when this recomp-ui pin has no LCD rows, so the caller can
+// leave config.ini exactly as it was rather than round-trip it through
+// settings the launcher never showed.
+template <typename T>
+inline bool push_lcd_effects(T& settings, bool ghosting, bool grid) {
+    if constexpr (has_lcd_effects<T>::value) {
+        settings.lcd_ghosting = ghosting ? 1 : 0;
+        settings.lcd_grid     = grid ? 1 : 0;
+        return true;
+    }
+    return false;
+}
+
+template <typename T>
+inline void pull_lcd_effects(const T& settings, int* ghosting, int* grid) {
+    if constexpr (has_lcd_effects<T>::value) {
+        *ghosting = settings.lcd_ghosting ? 1 : 0;
+        *grid     = settings.lcd_grid ? 1 : 0;
+    }
+}
+
+template <typename T>
+inline void set_lcd_effect_caps(T& game_info, bool ghosting, bool grid) {
+    if constexpr (has_lcd_effect_caps<T>::value) {
+        game_info.has_lcd_ghosting = ghosting ? 1 : 0;
+        game_info.has_lcd_grid     = grid ? 1 : 0;
+    }
+}
+
 // Same treatment for the solar-sensor fields, so this header still compiles
 // against a recomp-ui pin that predates them. Without the guard a game only has
 // to update gbarecomp to get a hard error in a third-party header it did not
@@ -235,13 +284,22 @@ inline bool pull_solar_settings(const T& settings, S* dst) {
 }
 
 // gbarecomp's screen-model tokens, in the launcher's kGbaScreenKindNames
-// index order (Raw/Unlit/Frontlit/Backlit/Classic).
-inline const char* const kScreenTokens[5] = {
-    "raw", "unlit", "frontlit", "backlit", "classic"
+// index order (Raw/Unlit/Frontlit/Backlit/Classic/Color corrected).
+inline const char* const kScreenTokens[] = {
+    "raw", "unlit", "frontlit", "backlit", "classic", "agb"
 };
+inline constexpr int kScreenTokenCount =
+    static_cast<int>(sizeof(kScreenTokens) / sizeof(kScreenTokens[0]));
+
+// The launcher can only show the models its own vocabulary names. This seam
+// knows "agb"; a recomp-ui pin that predates that row would clamp the index
+// back onto "classic", so such a pin is never handed it.
+inline int launcher_screen_kind_count() {
+    return std::min<int>(kScreenTokenCount, LNG_GBA_SCREEN_KIND_COUNT);
+}
 
 inline int screen_token_to_index(const std::string& tok) {
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < kScreenTokenCount; ++i)
         if (tok == kScreenTokens[i]) return i;
     return 0;
 }
@@ -322,6 +380,8 @@ struct SeamConfig {
     int  linear_filter = 0;
     int  sharp_filter = -1;
     int  affine_filter = -1;
+    int  lcd_ghosting = -1;    // unset -> game's requested default
+    int  lcd_grid = -1;        // unset -> game's requested default
     int  screen_kind = 0;      // kScreenTokens index
     int  volume = 100;
     int  skip_launcher = 0;
@@ -370,6 +430,8 @@ inline void seam_config_load(const std::string& path, SeamConfig* c) {
         else if (key == "linear_filter") c->linear_filter = std::atoi(val.c_str());
         else if (key == "sharp_filter") c->sharp_filter = std::atoi(val.c_str());
         else if (key == "affine_filter") c->affine_filter = std::atoi(val.c_str());
+        else if (key == "lcd_ghosting") c->lcd_ghosting = std::atoi(val.c_str());
+        else if (key == "lcd_grid")     c->lcd_grid = std::atoi(val.c_str());
         else if (key == "screen")        c->screen_kind = screen_token_to_index(val);
         else if (key == "volume")        c->volume = std::atoi(val.c_str());
         else if (key == "skip_launcher") c->skip_launcher = std::atoi(val.c_str());
@@ -392,7 +454,7 @@ inline void seam_config_load(const std::string& path, SeamConfig* c) {
     if (c->scale > 8) c->scale = 8;
     if (c->volume < 0) c->volume = 0;
     if (c->volume > 100) c->volume = 100;
-    if (c->screen_kind < 0 || c->screen_kind > 4) c->screen_kind = 0;
+    if (c->screen_kind < 0 || c->screen_kind >= kScreenTokenCount) c->screen_kind = 0;
     // Tri-state: 0 off, 1 borderless, 2 exclusive. Guard against a hand-
     // edited/garbage config.ini value; do NOT collapse to a bool here.
     if (c->fullscreen < 0 || c->fullscreen > 2) c->fullscreen = 0;
@@ -438,6 +500,8 @@ inline void seam_config_save(const std::string& path, const SeamConfig& c) {
     f << "linear_filter = " << c.linear_filter << "\n";
     f << "sharp_filter = " << c.sharp_filter << "\n";
     f << "affine_filter = " << c.affine_filter << "\n";
+    f << "lcd_ghosting = " << c.lcd_ghosting << "\n";
+    f << "lcd_grid = " << c.lcd_grid << "\n";
     f << "screen = " << kScreenTokens[c.screen_kind] << "\n";
     f << "volume = " << c.volume << "\n";
     f << "skip_launcher = " << c.skip_launcher << "\n";
@@ -571,6 +635,14 @@ inline void seam_append_setting_args(std::vector<std::string>& args,
         args.push_back("--affine-filter");
         args.push_back(c.affine_filter ? "1" : "0");
     }
+    if (opts.launcher_expose_lcd_ghosting) {
+        args.push_back("--lcd-ghosting");
+        args.push_back(c.lcd_ghosting ? "1" : "0");
+    }
+    if (opts.launcher_expose_lcd_grid) {
+        args.push_back("--lcd-grid");
+        args.push_back(c.lcd_grid ? "1" : "0");
+    }
     args.push_back("--screen");
     args.push_back(kScreenTokens[c.screen_kind]);
     // Tri-state: 0 off, 1 borderless, 2 exclusive. Pass the value explicitly
@@ -687,6 +759,10 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         cfg.sharp_filter = opts.launcher_default_sharp_filter ? 1 : 0;
     if (cfg.affine_filter < 0)
         cfg.affine_filter = opts.launcher_default_affine_filter ? 1 : 0;
+    if (cfg.lcd_ghosting < 0)
+        cfg.lcd_ghosting = opts.launcher_default_lcd_ghosting ? 1 : 0;
+    if (cfg.lcd_grid < 0)
+        cfg.lcd_grid = opts.launcher_default_lcd_grid ? 1 : 0;
     if (cfg.assist_tools < 0)
         cfg.assist_tools = opts.assist_tools_enabled_by_default ? 1 : 0;
     if (cfg.assist_fast_forward_multiplier < 2 ||
@@ -772,7 +848,15 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     ls.skip_launcher = cfg.skip_launcher;
     bool solar_in_launcher = false;
     if (opts.has_solar_sensor) solar_in_launcher = push_solar_settings(ls, solar);
-    ls.screen_kind   = cfg.screen_kind;
+    bool lcd_in_launcher = false;
+    if (opts.launcher_expose_lcd_ghosting || opts.launcher_expose_lcd_grid)
+        lcd_in_launcher = push_lcd_effects(ls, cfg.lcd_ghosting != 0,
+                                           cfg.lcd_grid != 0);
+    // Only the models this recomp-ui pin can name (launcher_screen_kind_count).
+    const int launcher_screen_kinds = launcher_screen_kind_count();
+    const int launcher_screen_kind_shown =
+        std::clamp(cfg.screen_kind, 0, launcher_screen_kinds - 1);
+    ls.screen_kind   = launcher_screen_kind_shown;
     ls.aspect_index  = cfg.aspect_index;
     ls.assist_tools = cfg.assist_tools;
     ls.assist_fast_forward_multiplier =
@@ -857,6 +941,8 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     gbarecomp_seam::set_presentation_filter_caps(
         gi, opts.launcher_expose_sharp_filter,
         opts.launcher_expose_affine_filter);
+    gbarecomp_seam::set_lcd_effect_caps(
+        gi, opts.launcher_expose_lcd_ghosting, opts.launcher_expose_lcd_grid);
 #if defined(GBARECOMP_ENABLE_MODS)
     gi.mods = mod_provider;
 #endif
@@ -902,8 +988,16 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         gbarecomp_seam::get_sharp_filter(ls, cfg.sharp_filter != 0) ? 1 : 0;
     cfg.affine_filter =
         gbarecomp_seam::get_affine_filter(ls, cfg.affine_filter != 0) ? 1 : 0;
-    cfg.screen_kind   = (ls.screen_kind >= 0 && ls.screen_kind <= 4)
-                          ? ls.screen_kind : 0;
+    // Only rewrite the LCD choices when this recomp-ui pin actually surfaced
+    // the rows, exactly like the solar section below.
+    if (lcd_in_launcher)
+        gbarecomp_seam::pull_lcd_effects(ls, &cfg.lcd_ghosting, &cfg.lcd_grid);
+    // A stored model this pin's launcher cannot name stays stored unless the
+    // player picked another one.
+    if (ls.screen_kind != launcher_screen_kind_shown)
+        cfg.screen_kind = (ls.screen_kind >= 0 &&
+                           ls.screen_kind < launcher_screen_kinds)
+                              ? ls.screen_kind : 0;
     cfg.volume        = ls.volume;
     cfg.skip_launcher = ls.skip_launcher ? 1 : 0;
     cfg.widescreen    = ls.widescreen ? 1 : 0;

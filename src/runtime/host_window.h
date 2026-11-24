@@ -38,7 +38,7 @@ public:
     // faithful view, wider when view-area expansion is active). Returns false on
     // failure (also when is_available() is false).
     // `screen` is the per-game color model from [video].screen in game.toml
-    // (raw|unlit|frontlit|backlit|classic), or nullptr for none. The
+    // (raw|unlit|frontlit|backlit|classic|agb), or nullptr for none. The
     // GBARECOMP_SCREEN env var, when set, overrides it.
     // `linear_filter` selects ordinary linear scaling. `sharp_filter` uses a
     // GPU integer prescale followed by a small fractional linear pass and
@@ -89,6 +89,26 @@ public:
     void set_audio_enabled(bool enabled);
     bool audio_enabled() const;
     void set_resize_driven_view(bool enabled);
+
+    // ---- present-time LCD presentation ---------------------------------
+    // All of these work on a copy of each frame at upload time, never on
+    // guest state, switch live (the in-game menu changes them between
+    // frames), and are no-ops while the window isn't open.
+    //
+    // LCD ghosting shows each frame averaged with the one before it, as the
+    // panel's slow response did. LCD grid shades the scaled-up image with
+    // the panel's pixel structure (NanoBoyAdvance's "LCD1x"); it takes
+    // precedence over the sharp scaler, which does the same integer
+    // prescale without the shading.
+    void set_lcd_ghosting(bool enabled);
+    bool lcd_ghosting() const;
+    void set_lcd_grid(bool enabled);
+    bool lcd_grid() const;
+    // Switch the screen model (color_lut tokens: raw|unlit|frontlit|backlit|
+    // classic|agb). An unrecognized name selects Raw. screen_model() reports
+    // the current one as a runtime::ScreenKind.
+    void set_screen(const char* screen);
+    int  screen_model() const;
 #if defined(GBARECOMP_RUNTIME_UI)
     // Attach the capability-only shared model. HostWindow presents it through
     // Dear ImGui's SDL_Renderer2 backend over the existing game renderer.

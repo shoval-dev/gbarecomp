@@ -30,6 +30,7 @@
 #include "gba_rom_header.h"
 #include "host_platform.h"
 #include "host_window.h"
+#include "color_lut.h"
 #include "touch_input.h"
 #include "runtime_arm.h"
 #include "runtime_bus_bridge.h"
@@ -54,6 +55,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -162,7 +164,7 @@ struct Args {
     std::string dump_bmp;
     std::string dump_png;    // --dump-png: final framebuffer as PNG (preferred)
     std::string load_state;  // --load-state <path>: headless savestate load
-    // [video] screen = raw|unlit|frontlit|backlit|classic — present-time
+    // [video] screen = raw|unlit|frontlit|backlit|classic|agb — present-time
     // color simulation (see color_lut). Empty = raw (passthrough). The
     // GBARECOMP_SCREEN env var overrides this at launch; --screen overrides
     // the TOML (launcher-driven).
@@ -177,6 +179,13 @@ struct Args {
     bool linear_filter = false;   // --linear-filter 1: linear texture scaling
     bool sharp_filter = false;    // --sharp-filter 1: integer prescale + linear finish
     bool affine_filter = false;   // --affine-filter 1: game-authorized smoothing
+    // [video] lcd_ghosting / lcd_grid = true|false — present-time effects of
+    // the handheld's own panel (present_effects.h): each frame averaged with
+    // the previous one, and the panel's pixel grid on the scaled-up image.
+    // Default off: the raw PPU frame is presented untouched. --lcd-ghosting /
+    // --lcd-grid override the TOML (launcher-driven).
+    bool lcd_ghosting = false;
+    bool lcd_grid = false;
     float gyro_sensitivity = 0.25f; // --gyro-sensitivity 0.25..4.00
     // [audio] shadow = true|false — arm the MP2K verified-enhancement shadow
     // mixer (default off). GBARECOMP_AUDIO_SHADOW overrides at launch.
@@ -234,6 +243,8 @@ struct Args {
 #define GBARECOMP_UI_KEY_FAST_FORWARD   "assist.fast_forward"
 #define GBARECOMP_UI_KEY_FAST_FORWARD_SPEED "assist.fast_forward_speed"
 #define GBARECOMP_UI_KEY_REWIND          "assist.rewind"
+#define GBARECOMP_UI_KEY_LCD_GRID        "graphics.lcd_grid"
+#define GBARECOMP_UI_KEY_SCREEN_MODEL    "graphics.screen_model"
 
 struct RuntimeUiContext {
     HostWindow* window = nullptr;
@@ -274,6 +285,14 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
     else if (std::strcmp(item->key,
                          GBARECOMP_UI_KEY_FAST_FORWARD_SPEED) == 0)
         *out = c->fast_forward_multiplier;
+#if defined(RECOMP_RUNTIME_UI_KEY_LCD_GHOSTING)
+    else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_LCD_GHOSTING) == 0)
+        *out = c->window->lcd_ghosting();
+#endif
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_LCD_GRID) == 0)
+        *out = c->window->lcd_grid();
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_SCREEN_MODEL) == 0)
+        *out = c->window->screen_model();
 #if defined(RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY)
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY) == 0 &&
              c->gyro_sensitivity)
@@ -311,6 +330,18 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
     else if (std::strcmp(item->key,
                          GBARECOMP_UI_KEY_FAST_FORWARD_SPEED) == 0)
         c->fast_forward_multiplier = std::clamp(value, 2, 10);
+#if defined(RECOMP_RUNTIME_UI_KEY_LCD_GHOSTING)
+    else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_LCD_GHOSTING) == 0)
+        c->window->set_lcd_ghosting(value != 0);
+#endif
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_LCD_GRID) == 0)
+        c->window->set_lcd_grid(value != 0);
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_SCREEN_MODEL) == 0) {
+        const int kind = std::clamp(value, 0, runtime::kScreenKindCount - 1);
+        const std::string token(runtime::screen_kind_name(
+            static_cast<runtime::ScreenKind>(kind)));
+        c->window->set_screen(token.c_str());
+    }
 #if defined(RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY)
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY) == 0 &&
              c->gyro_sensitivity)
@@ -756,6 +787,10 @@ bool apply_toml_file(const std::filesystem::path& path, Args* args,
             args->sharp_filter = (val == "true" || val == "1");
         } else if (section == "video" && key == "affine_filter") {
             args->affine_filter = (val == "true" || val == "1");
+        } else if (section == "video" && key == "lcd_ghosting") {
+            args->lcd_ghosting = (val == "true" || val == "1");
+        } else if (section == "video" && key == "lcd_grid") {
+            args->lcd_grid = (val == "true" || val == "1");
         } else if (section == "video" && key == "widescreen") {
             int n = 0;
             int width = 240;
@@ -788,7 +823,7 @@ constexpr std::string_view kCliValueFlags[] = {
     "--dump-png",    "--load-state",    "--view-width",    "--widescreen",
     "--save",        "--save-path",     "--gyro-sensitivity",
     "--sharp-filter", "--linear-filter", "--affine-filter", "--screen",
-    "--volume",
+    "--lcd-ghosting", "--lcd-grid", "--volume",
 };
 
 bool cli_flag_takes_value(std::string_view flag) {
@@ -1070,6 +1105,17 @@ bool parse_cli(int argc, char** argv, Args* args, std::string* err) {
                 return false;
             }
             args->affine_filter = af != 0;
+            continue;
+        }
+        if (s == "--lcd-ghosting" || s == "--lcd-grid") {
+            const char* v = need_value(s.c_str());
+            int flag = 0;
+            if (!v || !parse_int(v, &flag) || (flag != 0 && flag != 1)) {
+                if (err) *err = "invalid " + s + " value (expected 0 or 1)";
+                return false;
+            }
+            (s == "--lcd-ghosting" ? args->lcd_ghosting : args->lcd_grid) =
+                flag != 0;
             continue;
         }
         if (s == "--gyro-sensitivity") {
@@ -2875,6 +2921,17 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
         if (args.fullscreen) win.set_fullscreen(args.fullscreen);
         win.set_volume(args.volume);
+        win.set_lcd_ghosting(args.lcd_ghosting);
+        win.set_lcd_grid(args.lcd_grid);
+        std::fprintf(stderr,
+                     "[gbarecomp:runtime] presentation screen=%s ghosting=%s "
+                     "grid=%s\n",
+                     runtime::screen_kind_name(
+                         static_cast<runtime::ScreenKind>(win.screen_model()))
+                         .data(),
+                     win.lcd_ghosting() ? "on" : "off",
+                     win.lcd_grid() ? "on" : "off");
+        std::fflush(stderr);
         win.set_fps_readout(opts.show_fps_by_default);
 #if defined(GBARECOMP_RUNTIME_UI)
         runtime_ui_context.window = &win;
@@ -2951,6 +3008,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         if (runtime_ui_config.view_modes != RECOMP_RUNTIME_UI_VIEW_MODE_NATIVE)
             runtime_ui_config.features |=
                 RECOMP_RUNTIME_UI_STANDARD_VIEW_MODE;
+        // A game that opted into the LCD presentation surface gets the same
+        // controls in-game as in its launcher. Ghosting is recomp-ui's
+        // standard row; the screen model and the grid are engine rows below.
+        const bool lcd_surface = opts.launcher_expose_lcd_ghosting ||
+                                 opts.launcher_expose_lcd_grid;
+#if defined(RECOMP_RUNTIME_UI_STANDARD_LCD_GHOSTING)
+        if (lcd_surface)
+            runtime_ui_config.features |=
+                RECOMP_RUNTIME_UI_STANDARD_LCD_GHOSTING;
+#endif
 
         // Engine extras first, then whatever the game contributed.
 #if defined(RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY)
@@ -3041,6 +3108,41 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         fps_item.description = "Presents-per-second in the window title bar.";
         fps_item.type        = RECOMP_RUNTIME_UI_BOOL;
         runtime_ui_extras.push_back(fps_item);
+
+        if (lcd_surface) {
+            // The menu wants C strings: runtime::kScreenKindLabels are
+            // literals, so their buffers are NUL-terminated and static.
+            static const auto screen_model_choices = [] {
+                std::array<const char*, runtime::kScreenKindCount> labels{};
+                for (std::size_t i = 0; i < labels.size(); ++i)
+                    labels[i] = runtime::kScreenKindLabels[i].data();
+                return labels;
+            }();
+            RecompRuntimeUiItem screen_model_item{};
+            screen_model_item.key         = GBARECOMP_UI_KEY_SCREEN_MODEL;
+            screen_model_item.section     = "Graphics";
+            screen_model_item.label       = "Screen model";
+            screen_model_item.description =
+                "Colour model of the handheld's own screen.";
+            screen_model_item.type        = RECOMP_RUNTIME_UI_CHOICE;
+            screen_model_item.minimum     = 0;
+            screen_model_item.maximum     = runtime::kScreenKindCount - 1;
+            screen_model_item.step        = 1;
+            screen_model_item.choices     = screen_model_choices.data();
+            screen_model_item.choice_count =
+                static_cast<std::size_t>(runtime::kScreenKindCount);
+            runtime_ui_extras.push_back(screen_model_item);
+
+            RecompRuntimeUiItem grid_item{};
+            grid_item.key         = GBARECOMP_UI_KEY_LCD_GRID;
+            grid_item.section     = "Graphics";
+            grid_item.label       = "LCD grid";
+            grid_item.description =
+                "Shade the image with the screen's pixel grid. Visible from "
+                "a 3x window up.";
+            grid_item.type        = RECOMP_RUNTIME_UI_BOOL;
+            runtime_ui_extras.push_back(grid_item);
+        }
 
         if (opts.ui_extra_items && opts.ui_extra_item_count) {
             const auto* game_items =

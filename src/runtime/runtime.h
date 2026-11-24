@@ -307,6 +307,19 @@ struct RunOptions {
     // null => the launcher's default "assets/img/boxart.tga". Multi-variant
     // repos stage one file per variant (e.g. "assets/img/boxart_firered.tga").
     const char* launcher_boxart = nullptr;
+
+    // ---- present-time effects of the handheld's own panel ------------------
+    // Appended so every field above keeps its offset. Exposed as recomp-ui
+    // Video checkboxes and, in builds with the in-game menu, as the same rows
+    // there (together with an in-game Screen model row):
+    //   lcd_ghosting — each frame averaged with the previous one;
+    //   lcd_grid     — the panel's pixel structure on the scaled-up image.
+    // Both are independent of the screen model's colour grading, and both
+    // default off: the default presentation stays the raw PPU frame.
+    bool launcher_expose_lcd_ghosting = false;
+    bool launcher_default_lcd_ghosting = false;
+    bool launcher_expose_lcd_grid = false;
+    bool launcher_default_lcd_grid = false;
 };
 
 int run_game(int argc, char** argv, const RunOptions& opts = {});
